@@ -14,6 +14,7 @@ from openbb_core.provider.standard_models.options_chains import (
 from openbb_core.provider.utils.errors import EmptyDataError
 from openbb_deribit.utils.helpers import DERIBIT_OPTIONS_SYMBOLS
 from pydantic import Field, field_validator
+import logging
 
 
 class DeribitOptionsChainsQueryParams(OptionsChainsQueryParams):
@@ -127,8 +128,10 @@ class DeribitOptionsChainsFetcher(
         from openbb_deribit.utils.helpers import get_options_symbols
         from pandas import to_datetime
         from websockets.asyncio.client import connect
-        from warnings import warn
+        import logging
 
+        logger = logging.getLogger(__name__)
+        
         # We need to identify each option contract in order to fetch the chains data.
         symbols_dict: dict[str, str] = {}
 
@@ -141,7 +144,7 @@ class DeribitOptionsChainsFetcher(
         # We subscribe to each contract symbol and break the connection when we have all the data for an expiry.
         # If it takes too long, we break the connection and return an error message.
         results: list = []
-        messages: set = set()
+        messages: list = []
 
         async def call_api(expiration):
             """Call the Deribit API."""
@@ -160,7 +163,9 @@ class DeribitOptionsChainsFetcher(
                         receive_data(websocket, symbols, received_symbols), timeout=2.0
                     )
                 except asyncio.TimeoutError:
-                    messages.add(f"Timeout reached for {expiration}, data incomplete.")
+                    timeout_msg = f"Timeout reached for {expiration}, data incomplete."
+                    messages.append(timeout_msg)
+                    logger.warning(timeout_msg)
 
         async def receive_data(websocket, symbols, received_symbols):
             """Receive the data from the websocket with a timeout."""
@@ -175,7 +180,9 @@ class DeribitOptionsChainsFetcher(
                     continue
 
                 if "error" in data and data.get("error"):
-                    messages.add(f"Error while receiving data -> {data['error']}")
+                    error_msg = f"Error while receiving data -> {data['error']}"
+                    messages.append(error_msg)
+                    logger.warning(error_msg)
                     break
 
                 res = data.get("params", {}).get("data", {})
@@ -233,9 +240,16 @@ class DeribitOptionsChainsFetcher(
         if messages and not results:
             raise OpenBBError(", ".join(messages))
 
+        # Store messages in the result metadata instead of using the warning system
         if results and messages:
-            for message in messages:
-                warn(message)
+            # Deduplicate messages
+            unique_messages = list(set(messages))
+            # Log all unique messages but don't trigger warnings
+            for message in unique_messages:
+                logger.warning(message)
+
+            # We'll add the warnings to the OBBject metadata later in transform_data
+            kwargs["warning_messages"] = unique_messages
 
         if not results and not messages:
             raise EmptyDataError("All requests returned empty with no error messages.")
@@ -278,4 +292,12 @@ class DeribitOptionsChainsFetcher(
         df.loc[:, "contract_size"] = 1
         results = df.to_dict(orient="list")
 
-        return DeribitOptionsChainsData.model_validate(results)
+        result = DeribitOptionsChainsData.model_validate(results)
+
+        # Add any warning messages to the metadata
+        if warning_messages := kwargs.get("warning_messages", []):
+            if not hasattr(result, "metadata") or result.metadata is None:
+                result.metadata = {}
+            result.metadata["warnings"] = warning_messages
+
+        return result
